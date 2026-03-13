@@ -98,12 +98,6 @@ if __name__ == "__main__":
     np.save('tags.npy', all_tags)
     print("Finish processing tags.")
 
-    feature_file = np.memmap(
-        "features.dat",
-        dtype="float32",
-        mode="w+",
-        shape=(len(image_records),4,4,4096)
-    )
     
     # features = feature_model.predict(train_dataset, verbose=1)
     # index = 0
