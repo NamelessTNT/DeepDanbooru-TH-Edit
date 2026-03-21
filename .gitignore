@@ -17,3 +17,8 @@ test.py
 *.json
 *.npy
 th-project
+
+*.npy
+*.tfrecord
+*.keras
+*.h5

@@ -59,7 +59,7 @@ class DatasetWithTags:
         )   # get image data from path
         dataset = dataset.ignore_errors()
         dataset = dataset.map(
-            self.map_transformation_image_and_label,
+            self.map_label,
             num_parallel_calls=tf.data.AUTOTUNE
         )   # scale image and get multi-hot tag array
         dataset = dataset.batch(batch_size)
@@ -75,24 +75,21 @@ class DatasetWithTags:
             image = tfio.image.decode_webp(image_raw)
             image = tfio.experimental.color.rgba_to_rgb(image)
 
+        image = tf.image.resize(image, (self.width, self.height))
+        image = tf.cast(image, tf.float32) / 255.0
+
+        image.set_shape([self.width, self.height, 3])
+
         return (image, tag_string)
     
-    def map_transformation_image_and_label(self, image, tag_string):
+    def map_label(self, image, tag_string):
         return tf.py_function(
-            self.map_transformation_image_and_label_py,
+            self.map_label_py,
             (image, tag_string),
             (tf.float32, tf.float32)
         )
     
-    def map_transformation_image_and_label_py(self, image, tag_string):
-        image = image.numpy()
-        t = skimage.transform.AffineTransform(
-            translation=(-image.shape[1] * 0.5, -image.shape[0] * 0.5)
-        )   # centerize
-        image = skimage.transform.warp(
-            image, (t).inverse, output_shape=(self.height, self.width), order=1, mode="edge"
-        )
-        image = image / 255.0
+    def map_label_py(self, image, tag_string):
 
         tag_string = tag_string.numpy().decode()
         tag_array = np.array(tag_string.split(" "))

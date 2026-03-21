@@ -89,10 +89,10 @@ def extract_and_save_chunks(dataset, feature_model, save_prefix, max_items_per_f
 
 
 if __name__ == "__main__":
-    gpus = tf.config.experimental.list_physical_devices('GPU')
-    if gpus:
-        for gpu in gpus:
-            tf.config.experimental.set_memory_growth(gpu, True)
+    # gpus = tf.config.experimental.list_physical_devices('GPU')
+    # if gpus:
+    #     for gpu in gpus:
+    #         tf.config.experimental.set_memory_growth(gpu, True)
 
     print("Loading tags ... ")
     tags = dd.project.load_tags_from_project(project_path)
