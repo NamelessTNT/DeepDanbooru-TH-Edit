@@ -23,7 +23,7 @@ def serialize_example(input_feature, tag):
 def extract_feature(images, model):
     return model(images, training=False, verbose=False)
 
-def run_inference_to_tfrecord(model, dataset, output_dir):
+def run_inference_to_tfrecord(model, dataset, output_dir, items_per_shard=2000):
     if not os.path.exists(output_dir):
         os.makedirs(output_dir)
 
@@ -31,33 +31,51 @@ def run_inference_to_tfrecord(model, dataset, output_dir):
 
     global_idx = 0
     shard_idx = 0
+    item_in_shard = 0
 
     writer = None
     
     for img_batch, tag_batch in tqdm.tqdm(dataset):
         logits_batch = extract_feature(img_batch, model)
 
-        logits_numpy = logits_batch.numpy()
-        tag_numpy = tag_batch.numpy()
+        # logits_numpy = logits_batch.numpy()
+        # tag_numpy = tag_batch.numpy()
+        serialized_logits = tf.io.serialize_tensor(logits_batch)
+        serialized_labels = tf.io.serialize_tensor(tag_batch)
 
-        batch_size = logits_numpy.shape[0]
+        # batch_size = logits_numpy.shape[0]
 
-        for i in range(batch_size):
-            # 每 20,000 条数据一切片
-            if global_idx % 20000 == 0:
-                if writer: writer.close()
-                shard_path = os.path.join(output_dir, f"shard_{shard_idx:03d}.tfrecord")
-                writer = tf.io.TFRecordWriter(shard_path)
-                print(f"Writing Shard {shard_idx}...")
-                shard_idx += 1
+        # for i in range(batch_size):
+        #     # 每 20,000 条数据一切片
+        #     if global_idx % 20000 == 0:
+        #         if writer: writer.close()
+        #         shard_path = os.path.join(output_dir, f"shard_{shard_idx:03d}.tfrecord")
+        #         writer = tf.io.TFRecordWriter(shard_path)
+        #         print(f"Writing Shard {shard_idx}...")
+        #         shard_idx += 1
             
-            # 序列化
-            example_str = serialize_example(logits_numpy[i], tag_numpy[i])
-            writer.write(example_str)
-            global_idx += 1
+        #     # 序列化
+        #     example_str = serialize_example(logits_numpy[i], tag_numpy[i])
+        #     writer.write(example_str)
+        #     global_idx += 1
             
-        if global_idx % 5000 == 0:
-            print(f"Processed {global_idx} / 900,000 samples...")
+        # if global_idx % 5000 == 0:
+        #     print(f"Processed {global_idx} / 900,000 samples...")
+        if item_in_shard >= items_per_shard or writer is None:
+            if writer: writer.close()
+            shard_path = os.path.join(output_dir, f"shard_{shard_idx:03d}.tfrecord")
+            writer = tf.io.TFRecordWriter(shard_path)
+            shard_idx += 1
+            item_in_shard = 0
+        
+        example = tf.train.Example(features=tf.train.Features(feature={
+            'logits_blob': tf.train.Feature(bytes_list=tf.train.BytesList(value=[serialized_logits.numpy()])),
+            'labels_blob': tf.train.Feature(bytes_list=tf.train.BytesList(value=[serialized_labels.numpy()]))
+        }))
+        writer.write(example.SerializeToString())
+
+        batch_size = img_batch.shape[0]
+        item_in_shard += batch_size
 
     if writer:
         writer.close()
@@ -112,11 +130,11 @@ if __name__ == "__main__":
         f"Model : {source_model.input_shape} -> {source_model.output_shape} (loaded from {source_model_path})"
     )
     feature_layer = source_model.get_layer("activation_171").output
-    output_layer = tf.keras.layers.GlobalAveragePooling2D()(feature_layer)
+    # output_layer = tf.keras.layers.GlobalAveragePooling2D()(feature_layer)
     feature_model = tf.keras.Model(
         inputs=source_model.input,
-        outputs=output_layer
-        # outputs=feature_layer
+        # outputs=output_layer
+        outputs=feature_layer
     )
     feature_model.trainable=False
     # cut the original model
@@ -151,5 +169,5 @@ if __name__ == "__main__":
 
     # writer.close()
 
-    run_inference_to_tfrecord(feature_model, dataset, "./TFRecords")
+    run_inference_to_tfrecord(feature_model, dataset, "./TFRecords_Full")
     

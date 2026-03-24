@@ -17,7 +17,7 @@ def concatenate_records():
     dataslice = np.concatenate(dataslice)
     np.save("features.npy", dataslice)
 
-def model_construct():
+def build_unsquished_classifier():
     """build a new classifier"""
 
     inputs = tf.keras.Input(shape=(4, 4, 4096))
@@ -25,6 +25,37 @@ def model_construct():
     outputs =  tf.keras.layers.Activation("sigmoid", dtype="float32")(x)
 
     return tf.keras.Model(inputs, outputs)
+
+def build_custom_head(input_shape=(4, 4, 4096), num_classes=182):
+    inputs = tf.keras.layers.Input(shape=input_shape)
+
+    # 1. 局部特征提取 (1x1 Conv 替代原版，但增加非线性)
+    # 这一步是为了将 DeepDanbooru 的通用特征映射到你特定 IP 的语义空间
+    x = tf.keras.layers.Conv2D(1024, (1, 1), padding='same', activation='relu')(inputs)
+    x = tf.keras.layers.BatchNormalization()(x)
+    
+    # 2. 引入空间注意力机制 (非常重要)
+    # 因为 4x4 的 grid 虽然小，但每个点代表了原图很大的感受野
+    # 我们通过一个简单的注意力分支，让模型决定 16 个点中哪些点对识别这 182 个角色最重要
+    attention = tf.keras.layers.Conv2D(1, (1, 1), activation='sigmoid')(x)
+    x = tf.keras.layers.Multiply()([x, attention])
+
+    # 3. 混合池化 (结合 GAP 和 GMP)
+    # GAP 提取全局平滑特征，GMP (Global Max Pooling) 提取显著的局部特征（如某个角色的徽章）
+    gap = tf.keras.layers.GlobalAveragePooling2D()(x)
+    gmp = tf.keras.layers.GlobalMaxPooling2D()(x)
+    
+    merged = tf.keras.layers.Concatenate()([gap, gmp]) # 2048 维
+    
+    # 4. 分类器
+    x = tf.keras.layers.Dropout(0.5)(merged)
+    x = tf.keras.layers.Dense(512, activation='relu')(x)
+    x = tf.keras.layers.BatchNormalization()(x)
+    
+    # 多标签分类输出层
+    outputs = tf.keras.layers.Dense(num_classes, activation='sigmoid')(x)
+    
+    return tf.keras.models.Model(inputs, outputs)
 
 def model_construct_ver_1():
 
@@ -35,25 +66,63 @@ def model_construct_ver_1():
 
     return tf.keras.Model(inputs, outputs)
 
-# def data_generator():
-#     """yield data one by one to avoid oom"""
-#     batch_size = 512
+def parse_fn(example_proto):
+    """解析单条 TFRecord 记录"""
+    feature_description = {
+        'logits': tf.io.FixedLenFeature([4096], tf.float32),
+        'tags': tf.io.FixedLenFeature([182], tf.float32),
+    }
 
-#     feature_files = sorted(glob.glob("squished_features_*.npy"))
-#     tags = np.load("tags_large.npy", mmap_mode="r")
+    parsed_features = tf.io.parse
+
+def parse_unsquished_records(example_proto):
+    """解析未经压缩的 (4,4,4096) feature"""
+    feature_description = {
+        'logits_blob': tf.io.FixedLenFeature([], tf.string),
+        'labels_blob': tf.io.FixedLenFeature([], tf.string),
+    }
+    parsed = tf.io.parse_single_example(example_proto, feature_description)
+
+    logits = tf.io.parse_tensor(parsed['logits_blob'], out_type=tf.float32)
+    labels = tf.io.parse_tensor(parsed['labels_blob'], out_type=tf.float32)
     
-#     tag_index = 0
-#     for f in feature_files:
-#         features = np.load(f, mmap_mode='r')
-#         length = features.shape[0]
+    logits = tf.reshape(logits, [-1, 4, 4, 4096])
+    labels = tf.reshape(labels, [-1, 182])
 
-#         for index in range(0, length, batch_size):
-#             feature_batch = features[index : index+batch_size]
-#             tag_batch = tags[tag_index : tag_index + len(feature_batch)]
+    return logits, labels
 
-#             tag_index += len(feature_batch)
+def split_files(tfrecord_pattern, train_ratio=0.9):
+    """split dataset on file level"""
+    tfrecord_paths = tf.data.Dataset.list_files(tfrecord_pattern)
+    
+    n_total = len(tfrecord_paths)
+    n_train = int(n_total * train_ratio)
 
-#             yield feature_batch, tag_batch
+    train_files = tfrecord_paths.take(n_train)
+    val_files = tfrecord_paths.skip(n_train)
+
+    return train_files, val_files
+
+def load_unsquished_dataset(file_paths, batch_size=128, training=True):
+    """construct dataset from tfrecords"""
+    raw_dataset = file_paths.interleave(
+        lambda x: tf.data.TFRecordDataset(x),
+        cycle_length=32,
+        num_parallel_calls=32,
+        deterministic=not training
+    )
+    
+    mapped_dataset = raw_dataset.map(parse_unsquished_records,
+                                     num_parallel_calls=tf.data.AUTOTUNE)
+    final_dataset = (
+        mapped_dataset
+        .unbatch()
+        .batch(batch_size)
+        .prefetch(tf.data.AUTOTUNE)
+    )
+
+    return final_dataset
+
 
 def data_generator(target_indices, feature_files, samples_per_file, all_tags):
     """data generator with splitting"""
@@ -74,26 +143,76 @@ def data_generator(target_indices, feature_files, samples_per_file, all_tags):
             relative_idx = i - start_idx
             yield fearures_chunk[relative_idx], all_tags[i]
 
+def main():
+    batch_size = 128
+
+    train_metrics = [
+        tf.keras.metrics.BinaryAccuracy(name='acc'),
+        tf.keras.metrics.AUC(multi_label=True, name='auc'),
+        tf.keras.metrics.Precision(name='precision'),
+        tf.keras.metrics.Recall(name='recall')
+    ]
+
+    val_metrics = [
+        tf.keras.metrics.BinaryAccuracy(name='acc'),
+        tf.keras.metrics.AUC(multi_label=True, name='auc')
+    ]
+
+    tfrecord_pattern = 'TFRecords_Full/shard_*.tfrecord'
+    train_files, val_files = split_files(tfrecord_pattern)
+
+    train_ds = load_unsquished_dataset(train_files, batch_size=batch_size)
+    val_ds = load_unsquished_dataset(val_files,batch_size=batch_size, training=False)
+
+    model = build_unsquished_classifier()
+    model.compile(
+        optimizer=tf.keras.optimizers.Adam(1e-4),
+        loss=tf.keras.losses.BinaryFocalCrossentropy(),
+        metrics=train_metrics
+    )
+
+    callbacks = [
+        # 自动保存最佳模型
+        tf.keras.callbacks.ModelCheckpoint(
+            filepath='./checkpoints/best_character_model.keras',
+            monitor='val_auc',
+            mode='max',
+            save_best_only=True,
+            verbose=1
+        ),
+        # 学习率衰减：当 val_loss 不再下降时自动减小学习率
+        tf.keras.callbacks.ReduceLROnPlateau(
+            monitor='val_loss',
+            factor=0.2,
+            patience=3,
+            min_lr=1e-7,
+            verbose=1
+        ),
+        # 早停：防止过拟合
+        tf.keras.callbacks.EarlyStopping(
+            monitor='val_auc',
+            patience=6,
+            mode='max',
+            restore_best_weights=True
+        ),
+        # TensorBoard 可视化
+        tf.keras.callbacks.TensorBoard(log_dir='./logs')
+    ]
+
+    model.fit(
+        train_ds,
+        validation_data=val_ds,
+        epochs=50,
+        callbacks=callbacks,
+        verbose=1
+    )
+
+    model.save('checkpoints/us_conv_1.keras', include_optimizer=False)
 
 
-
-if __name__ == "__main__":
+def npy_train_procedure():
     batch_size = 512
 
-    gpus = tf.config.experimental.list_physical_devices('GPU')
-    if gpus:
-        for gpu in gpus:
-            tf.config.experimental.set_memory_growth(gpu, True)
-    
-    # output_signature = (
-    #     tf.TensorSpec(shape=(None, 4096), dtype=tf.float32),
-    #     tf.TensorSpec(shape=(None, OUTPUT_FEATURES), dtype=tf.float32)
-    # )
-
-    # dataset = tf.data.Dataset.from_generator(
-    #     data_generator,
-    #     output_signature=output_signature
-    # )
     feature_files = sorted(glob.glob("squished_features_*.npy"))
     samples_per_file = 32000
     tags = np.load("tags_large.npy", mmap_mode='r')
@@ -149,3 +268,6 @@ if __name__ == "__main__":
             epochs=150)
     
     model.save('all_data_dense.keras', include_optimizer=False)
+
+if __name__ == "__main__":
+    main()
