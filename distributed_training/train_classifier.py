@@ -1,9 +1,11 @@
 import os
 import glob
+import tomllib
 
 import numpy as np
 import tensorflow as tf
 import deepdanbooru as dd
+from sys import argv
 
 from sklearn.model_selection import train_test_split
 
@@ -17,11 +19,14 @@ def concatenate_records():
     dataslice = np.concatenate(dataslice)
     np.save("features.npy", dataslice)
 
-def build_unsquished_classifier():
+def build_unsquished_classifier(weight_path=None):
     """build a new classifier"""
 
     inputs = tf.keras.Input(shape=(4, 4, 4096))
     x = dd.model.layers.conv_gap(inputs, OUTPUT_FEATURES)
+    if weight_path:
+        new_weights = np.load(weight_path)
+        x.set_weights(new_weights)
     outputs =  tf.keras.layers.Activation("sigmoid", dtype="float32")(x)
 
     return tf.keras.Model(inputs, outputs)
@@ -143,8 +148,21 @@ def data_generator(target_indices, feature_files, samples_per_file, all_tags):
             relative_idx = i - start_idx
             yield fearures_chunk[relative_idx], all_tags[i]
 
-def main():
-    batch_size = 128
+def main(config_path):
+    """main train logic"""
+
+    with open(config_path, 'rb') as f:
+        train_config = tomllib.load(f)
+
+    batch_size = train_config["batch_size"]
+    initial_learning_rate = train_config["learning_rate"]
+    minimum_learning_rate = train_config["min_lr"]
+    lr_patience = train_config["lr_patience"]
+    early_stopping_patience = train_config["early_stopping_patience"]
+    tb_log_dir = train_config["tb_log_dir"]
+    checkpoint_path = train_config["checkpoint_path"]
+
+    weight_path = train_config["weight_path"]
 
     train_metrics = [
         tf.keras.metrics.BinaryAccuracy(name='acc'),
@@ -164,9 +182,10 @@ def main():
     train_ds = load_unsquished_dataset(train_files, batch_size=batch_size)
     val_ds = load_unsquished_dataset(val_files,batch_size=batch_size, training=False)
 
-    model = build_unsquished_classifier()
+    model = build_unsquished_classifier(weight_path=weight_path)
+    # model = build_custom_head()
     model.compile(
-        optimizer=tf.keras.optimizers.Adam(1e-4),
+        optimizer=tf.keras.optimizers.Adam(initial_learning_rate),
         loss=tf.keras.losses.BinaryFocalCrossentropy(),
         metrics=train_metrics
     )
@@ -174,40 +193,39 @@ def main():
     callbacks = [
         # 自动保存最佳模型
         tf.keras.callbacks.ModelCheckpoint(
-            filepath='./checkpoints/best_character_model.keras',
+            filepath=os.path.join(checkpoint_path, "best.keras"),
             monitor='val_auc',
             mode='max',
             save_best_only=True,
-            verbose=1
+            verbose=1,
+            save_weights_only=True
         ),
         # 学习率衰减：当 val_loss 不再下降时自动减小学习率
         tf.keras.callbacks.ReduceLROnPlateau(
             monitor='val_loss',
             factor=0.2,
-            patience=3,
-            min_lr=1e-7,
+            patience=lr_patience,
+            min_lr=minimum_learning_rate,
             verbose=1
         ),
         # 早停：防止过拟合
         tf.keras.callbacks.EarlyStopping(
             monitor='val_auc',
-            patience=6,
+            patience=early_stopping_patience,
             mode='max',
             restore_best_weights=True
         ),
         # TensorBoard 可视化
-        tf.keras.callbacks.TensorBoard(log_dir='./logs')
+        tf.keras.callbacks.TensorBoard(log_dir=tb_log_dir)
     ]
 
     model.fit(
         train_ds,
         validation_data=val_ds,
-        epochs=50,
+        epochs=150,
         callbacks=callbacks,
         verbose=1
     )
-
-    model.save('checkpoints/us_conv_1.keras', include_optimizer=False)
 
 
 def npy_train_procedure():
@@ -270,4 +288,5 @@ def npy_train_procedure():
     model.save('all_data_dense.keras', include_optimizer=False)
 
 if __name__ == "__main__":
-    main()
+    default_config_path = "./train_configs/train_config.toml"
+    main(default_config_path)
